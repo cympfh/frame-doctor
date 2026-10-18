@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""frame-doctor: Steam Frame の健康チェック。読むだけで、何も変えない。Python 3 の標準ライブラリだけで動く。"""
+"""frame-doctor: Steam Frame の健康チェック。読むだけで、何も変えない。Python 3 の標準ライブラリだけで動く。
+いまの状態だけで判定する（過去のログは、今も同じエラーが出ているときだけ数える）。"""
 import argparse
 import datetime
 import glob
@@ -8,16 +9,21 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HOME = os.path.expanduser("~")
 BIN = os.path.join(HOME, ".local/bin")
 OPT = os.path.join(HOME, ".local/opt")
 UNIT_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd/user")
 VRCMD_DIR = "/opt/steamvr/bin/linuxarm64"
+RECENT_SECONDS = 120        # 「今も出ている」とみなすログの範囲
+STARTUP_GRACE_SECONDS = 60  # 起動直後のこの秒数のログは、起動時のよくある一時的なものとして数えない
+EYE_MMAP = "/dev/shm/eye-server.mmap"
 ROOM_VIEW_STYLES = {0: "既定", 1: "輪郭 A", 2: "輪郭 B", 3: "半透明の映像", 4: "不透明な映像"}
 
 # (表示名, unit, バージョンの取り方, プロセス名, パネルの「閉じる」で終われるもの)
@@ -67,8 +73,11 @@ class Report:
     def __init__(self):
         self.items = []
 
-    def add(self, section, level, title, message, **data):
-        self.items.append({"section": section, "level": level, "title": title, "message": message, "data": data})
+    def add(self, section, level, title, message, brief=None, reason=None, **data):
+        """brief: ふだんの表示（1 行ずつ）に出すときの名前。None ならくわしい表示（--verbose）だけ。
+        reason: 警告・エラーのときにかっこ内に書く短い説明（無ければ message）。"""
+        self.items.append({"section": section, "level": level, "title": title, "message": message,
+                           "brief": brief, "reason": reason, "data": data})
 
 
 # ---------------------------------------------------------------- 本体のようす
@@ -88,7 +97,8 @@ def check_temps(r, warn_c, error_c):
     msg = f"SoC 最高 {hot:.1f} °C（{name}）"
     if gpu is not None:
         msg += f"、GPU {gpu:.1f} °C"
-    r.add("本体", level, "温度", msg, hottest_c=hot, hottest_zone=name, gpu_c=gpu)
+    reason = f"{hot:.0f} °C。少し外して冷ましてください" if level != OK else None
+    r.add("本体", level, "温度", msg, brief="温度", reason=reason, hottest_c=hot, hottest_zone=name, gpu_c=gpu)
 
 
 def check_throttling(r):
@@ -104,9 +114,10 @@ def check_throttling(r):
             capped.append(f"{os.path.basename(p)} {int(mx) // 1000}/{int(hw) // 1000} MHz")
     if limited or capped:
         r.add("本体", WARN, "熱による制限", "クロックが下げられています: " + "、".join(limited + capped),
-              cooling=limited, capped=capped)
+              brief="熱による制限", reason="熱で動作が遅くされています", cooling=limited, capped=capped)
     else:
-        r.add("本体", OK, "熱による制限", "制限なし（CPU・GPU とも最大クロックまで使えます）", cooling=[], capped=[])
+        r.add("本体", OK, "熱による制限", "制限なし（CPU・GPU とも最大クロックまで使えます）", brief="熱による制限",
+              cooling=[], capped=[])
 
 
 def check_battery(r):
@@ -125,7 +136,8 @@ def check_battery(r):
     msg = f"{cap}%（{ja}）"
     if temp and temp.lstrip("-").isdigit():
         msg += f"、{int(temp) / 10:.1f} °C"
-    r.add("本体", level, "バッテリー", msg, percent=capn, status=status)
+    reason = f"残り {capn}%。充電してください" if level != OK else None
+    r.add("本体", level, "バッテリー", msg, brief="バッテリー", reason=reason, percent=capn, status=status)
 
 
 def size(n):
@@ -137,6 +149,7 @@ def size(n):
 
 def check_disks(r):
     seen = set()
+    worst = None
     for mnt, label in (("/", "システム"), ("/home", "ホーム"), ("/var", "/var")):
         try:
             st = os.statvfs(mnt)
@@ -150,6 +163,11 @@ def check_disks(r):
         level = ERROR if pct < 5 else WARN if pct < 10 else OK
         r.add("本体", level, f"空き容量（{label}）", f"{size(free)} 空き / {size(total)}（{pct:.0f}%）",
               mount=mnt, free_bytes=free, total_bytes=total)
+        if worst is None or RANK[level] > RANK[worst[0]]:
+            worst = (level, f"{label}の残りが {size(free)}")
+    if worst:   # ふだんの表示は 1 行にまとめる
+        r.add("本体", worst[0], "空き容量", "（上の各項目のまとめ）", brief="空き容量",
+              reason=worst[1] if worst[0] != OK else None)
 
 
 def check_uptime(r):
@@ -181,9 +199,11 @@ def check_steamvr(r):
     active, _ = unit_state("steamvr")
     rc, _ = run(["pgrep", "-x", "vrserver"], timeout=5)
     if active == "active" or rc == 0:
-        r.add("SteamVR", OK, "SteamVR", "動いています", service=active, vrserver=rc == 0)
+        r.add("SteamVR", OK, "SteamVR", "動いています", brief="SteamVR", service=active, vrserver=rc == 0)
     else:
-        r.add("SteamVR", WARN, "SteamVR", "動いていません（デスクトップモードなら正常）", service=active, vrserver=False)
+        # デスクトップモードでは止まっているのが普通なので、警告にはしない
+        r.add("SteamVR", INFO, "SteamVR", "動いていません（デスクトップモードなら正常）", brief="SteamVR", reason="停止中",
+              service=active, vrserver=False)
 
 
 def tool_version(how):
@@ -232,18 +252,103 @@ def check_tools(r, vr_running):
             running = run(["pgrep", "-x", proc], timeout=5)[0] == 0   # ダッシュボードの＋から起動したもの
         stale = stale_processes(proc)
         msg = f"{ver or '?'}、{'動作中' if running else '停止中'}、{auto}"
-        level = OK
+        level, brief, reason = OK, (label if running else None), None
         if stale:
-            level = WARN
-            msg += "。古い版のまま動いています（終了するか SteamVR を再起動すると新しい版になります）"
-        elif enabled == "enabled" and vr_running and not running:
+            # 動いてはいるので異常ではない（更新のあと、次に起動したときに新しい版になる）
+            msg += "。更新前の版のまま動いています（終了するか SteamVR を再起動すると新しい版になります）"
+        if enabled == "enabled" and vr_running and not running:
             if closable:
                 level = INFO
                 msg += "。閉じられています（ダッシュボードの＋から開けます。次の SteamVR 起動で自動で開きます）"
             else:
-                level = WARN
-                msg += "。SteamVR が動いているのに止まっています"
-        r.add("ツール", level, label, msg, version=ver, active=active, enabled=enabled, running=running, stale_pids=stale)
+                level, brief, reason = WARN, label, "SteamVR が動いているのに止まっています"
+                msg += "。" + reason
+        elif not running:
+            level = INFO   # 自動起動オフで止まっている・SteamVR が止まっている: ふつうの状態なので、ふだんは出さない
+        r.add("ツール", level, label, msg, brief=brief, reason=reason, version=ver, active=active, enabled=enabled,
+              running=running, stale_pids=stale)
+
+
+def check_audio(r):
+    """既定のマイクとスピーカーが今あるか（wpctl で読むだけ）。"""
+    if not shutil.which("wpctl"):
+        r.add("音", INFO, "音", "wpctl がありません")
+        return
+    for target, name in (("@DEFAULT_AUDIO_SOURCE@", "マイク"), ("@DEFAULT_AUDIO_SINK@", "スピーカー")):
+        rc, out = run(["wpctl", "get-volume", target], timeout=5)
+        m = re.search(r"Volume:\s*([\d.]+)(.*)", out)
+        if rc == 0 and m:
+            muted = "MUTED" in m.group(2)
+            r.add("音", OK, name, f"音量 {float(m.group(1)) * 100:.0f}%{'（ミュート中）' if muted else ''}", brief=name,
+                  volume=float(m.group(1)), muted=muted)
+        else:
+            r.add("音", WARN, name, f"既定の{name}が見つかりません（{out[:100]}）", brief=name,
+                  reason=f"既定の{name}が見つかりません")
+
+
+def check_eye(r, vr_running):
+    """frameeyeosc が今、目のデータを読めているか（status.json と eye-server.mmap を見るだけ）。"""
+    if not os.path.exists(os.path.join(UNIT_DIR, "frameeyeosc.service")):
+        return
+    active, _ = unit_state("frameeyeosc")
+    if active != "active":
+        return   # 動いているかどうかはツールの項目で見る
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "frameeyeosc/status.json")
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = None
+    now = time.time()
+    age = now - st.get("time", 0) if st else None
+    problem = None
+    if st is None or age > 10:
+        problem = "frameeyeosc の状態が更新されていません"
+    elif st.get("source_error"):
+        problem = f"目のデータが読めません（{str(st['source_error'])[:80]}）"
+    elif st.get("config_error"):
+        problem = f"設定ファイルに問題があります（{str(st['config_error'])[:80]}）"
+    elif vr_running and not os.path.exists(EYE_MMAP):
+        problem = "目のデータが読めません（目のデータのファイルがありません）"
+    else:
+        le = st.get("last_error") or {}
+        t, started = le.get("time") or 0, st.get("started") or 0
+        if now - t < RECENT_SECONDS and t - started > STARTUP_GRACE_SECONDS:
+            problem = f"いまエラーが出ています（{str(le.get('text'))[:80]}）"
+    if problem:
+        r.add("ツール", WARN, "視線データ", problem, brief="視線データ", reason=problem)
+    else:
+        r.add("ツール", OK, "視線データ",
+              f"読めています（{age:.1f} 秒前に更新、{'目を追えています' if st.get('tracking') else 'かぶっていないか、目を追えていません'}）",
+              brief="視線データ", tracking=st.get("tracking"))
+
+
+def check_network(r, host="github.com", port=443, timeout=4.0):
+    """インターネットにつながるか（名前解決と、つなげるかだけ。何も送らない）。"""
+    result = {}
+
+    def resolve():
+        try:
+            result["addr"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            result["err"] = e
+    th = threading.Thread(target=resolve, daemon=True)
+    th.start()
+    th.join(timeout)
+    if "addr" not in result:
+        r.add("ネット", WARN, "ネット", f"{host} の名前解決ができません", brief="ネット",
+              reason="インターネットにつながりません（名前解決ができません）")
+        return
+    family, stype, proto, _, sa = result["addr"][0]
+    try:
+        with socket.socket(family, stype, proto) as sk:
+            sk.settimeout(timeout)
+            sk.connect(sa)
+    except OSError:
+        r.add("ネット", WARN, "ネット", f"{host}:{port} につながりません", brief="ネット",
+              reason="インターネットにつながりません")
+        return
+    r.add("ネット", OK, "ネット", f"{host} につながります", brief="ネット")
 
 
 def check_mic(r):
@@ -288,61 +393,136 @@ def looks_like_error(line):
     return bool(ERROR_PATTERN.search(NOT_ERROR.sub("", line)))
 
 
-def check_logs(r, since):
+def log_units():
+    return ["steamvr"] + [t[1] for t in TOOLS if os.path.exists(os.path.join(UNIT_DIR, t[1] + ".service"))]
+
+
+def unit_started(unit):
+    """サービスが今の状態になった時刻（UNIX 秒）。分からなければ None。"""
+    _, out = run(["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp", "--timestamp=unix", "--value",
+                  unit + ".service"], timeout=5)
+    m = re.search(r"@(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def error_lines(unit, since):
+    rc, out = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "--no-pager", "-o", "cat"],
+                  timeout=20)
+    lines = [l for l in out.splitlines() if l and not l.startswith("-- ")]
+    errs = [l for l in lines if looks_like_error(l)]
+    _, prio = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "-p", "err",
+                   "--no-pager", "-o", "cat"], timeout=20)
+    prio_lines = [l for l in prio.splitlines() if l and not l.startswith("-- ")]
+    return errs + [l for l in prio_lines if l not in errs]
+
+
+def check_logs(r, now=None):
+    """今もエラーが出ているか: 直近 2 分のログだけを見る。起動して 1 分以内のログ（起動時の一時的なもの）は数えない。"""
     if not shutil.which("journalctl"):
-        r.add("ログ", INFO, "ログ", "journalctl がありません")
         return
-    units = ["steamvr"] + [t[1] for t in TOOLS]
-    for unit in units:
-        if unit != "steamvr" and not os.path.exists(os.path.join(UNIT_DIR, unit + ".service")):
+    now = now or time.time()
+    for unit in log_units():
+        since = now - RECENT_SECONDS
+        started = unit_started(unit)
+        if started:
+            since = max(since, started + STARTUP_GRACE_SECONDS)
+        if since >= now:
+            r.add("ログ", OK, unit, "起動したばかりなので、まだ見ていません", count=0)
             continue
-        rc, out = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "--no-pager", "-o", "cat"],
-                      timeout=20)
-        if rc != 0 and not out:
-            continue
-        lines = [l for l in out.splitlines() if l and not l.startswith("-- ")]
-        errs = [l for l in lines if looks_like_error(l)]
-        _, prio = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "-p", "err",
-                         "--no-pager", "-o", "cat"], timeout=20)
-        prio_lines = [l for l in prio.splitlines() if l and not l.startswith("-- ")]
-        n = len(errs) + len([l for l in prio_lines if l not in errs])   # 重要度 err 以上の行と、エラーらしい言葉を含む行
-        if n:
-            last = (prio_lines or errs)[-1]
-            r.add("ログ", WARN, unit, f"エラーらしい行が {n} 行（最後: {last[:120]}）", count=n, last=last)
+        errs = error_lines(unit, f"@{int(since)}")
+        if errs:
+            reason = f"今もエラーが出ています: {errs[-1][:80]}"
+            r.add("ログ", WARN, unit, f"直近 {RECENT_SECONDS // 60} 分にエラーらしい行が {len(errs)} 行（最後: {errs[-1][:120]}）",
+                  brief=f"{unit} のログ", reason=reason, count=len(errs), last=errs[-1])
         else:
-            r.add("ログ", OK, unit, "エラーなし", count=0)
+            r.add("ログ", OK, unit, f"直近 {RECENT_SECONDS // 60} 分はエラーなし", count=0)
+
+
+def check_history(r, since):
+    """--history: 過去のログのエラーを参考として出す（判定には使わない）。"""
+    if not shutil.which("journalctl"):
+        return
+    for unit in log_units():
+        errs = error_lines(unit, since)
+        if errs:
+            r.add("過去のログ", INFO, unit, f"{len(errs)} 行（最後: {errs[-1][:120]}）", count=len(errs), last=errs[-1], past=True)
+        else:
+            r.add("過去のログ", INFO, unit, "なし", count=0, past=True)
 
 
 # ---------------------------------------------------------------- 表示
-def render(report, color, since):
+WORD = {OK: "正常", WARN: "警告", ERROR: "エラー"}
+
+
+def brief_line(it):
+    lv = it["level"]
+    if lv == INFO:
+        return f"{it['brief']}：{it['reason'] or it['message']}"
+    if lv == OK:
+        return f"{it['brief']}：正常"
+    return f"{it['brief']}：{WORD[lv]}（{it['reason'] or it['message']}）"
+
+
+def render_brief(report, color, history_since):
+    c = {OK: "\033[32m", INFO: "\033[36m", WARN: "\033[33m", ERROR: "\033[31m", "0": "\033[0m"}
+    if not color:
+        c = {k: "" for k in c}
+    now_items = [i for i in report.items if not i["data"].get("past")]
+    for it in now_items:
+        if it["brief"]:
+            print(f"{c[it['level']]}{brief_line(it)}{c['0']}")
+    if any(i["level"] in (WARN, ERROR) for i in now_items):
+        print("（くわしくは frame-doctor --verbose）")
+    render_history(report, history_since)
+
+
+def render_history(report, since):
+    past = [i for i in report.items if i["data"].get("past")]
+    if not past:
+        return
+    print(f"\n■ 過去のログ（直近 {since}。参考です。今の状態とは関係ありません）")
+    for it in past:
+        print(f"  {it['title']}: {it['message']}")
+
+
+def render(report, color, history_since=None):
     c = {"OK": "\033[32m", "INFO": "\033[36m", "WARN": "\033[33m", "ERROR": "\033[31m", "b": "\033[1m", "d": "\033[2m", "0": "\033[0m"}
     if not color:
         c = {k: "" for k in c}
     now = datetime.datetime.now().astimezone()
     print(f"{c['b']}frame-doctor {VERSION} — Steam Frame の健康チェック（{now:%Y-%m-%d %H:%M} {now.tzname()}）{c['0']}")
     section = None
-    for it in report.items:
+    items = [i for i in report.items if not i["data"].get("past")]
+    for it in items:
         if it["section"] != section:
             section = it["section"]
-            extra = f"（直近 {since}）" if section == "ログ" else ""
+            extra = f"（直近 {RECENT_SECONDS // 60} 分。起動直後の 1 分は数えません）" if section == "ログ" else ""
             print(f"\n{c['b']}■ {section}{extra}{c['0']}")
         lv = it["level"]
         print(f"  {c[lv]}[{lv:^5}]{c['0']} {it['title']}: {it['message']}")
-    counts = {k: sum(1 for i in report.items if i["level"] == k) for k in (OK, INFO, WARN, ERROR)}
+    counts = {k: sum(1 for i in items if i["level"] == k) for k in (OK, INFO, WARN, ERROR)}
     print(f"\n{c['b']}まとめ:{c['0']} {c['OK']}OK {counts[OK]}{c['0']} / {c['INFO']}INFO {counts[INFO]}{c['0']} / "
           f"{c['WARN']}WARN {counts[WARN]}{c['0']} / {c['ERROR']}ERROR {counts[ERROR]}{c['0']}")
+    render_history(report, history_since)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Steam Frame の健康チェック（読むだけ）")
+    ap = argparse.ArgumentParser(description="Steam Frame の健康チェック（読むだけ）。いまの状態だけで判定します")
+    ap.add_argument("-v", "--verbose", action="store_true", help="くわしく（各項目の値も出す）")
     ap.add_argument("--json", action="store_true", help="JSON で出す")
+    ap.add_argument("--history", nargs="?", const="24h", metavar="範囲",
+                    help="過去のログのエラーも参考として出す（既定 24h。判定には使わない）")
     ap.add_argument("--no-color", action="store_true", help="色を付けない")
-    ap.add_argument("--since", default="24h", help="ログを見る範囲（journalctl の --since。既定 24h）")
+    ap.add_argument("--since", help=argparse.SUPPRESS)   # 0.2 までの互換: --history と同じ
+    ap.add_argument("--no-network", action="store_true", help="ネットの確認をしない")
     ap.add_argument("--warn-temp", type=float, default=80.0, help="温度の注意ライン（°C）")
     ap.add_argument("--error-temp", type=float, default=90.0, help="温度のエラーライン（°C）")
     ap.add_argument("--version", action="version", version=f"frame-doctor {VERSION}")
     a = ap.parse_args(argv)
-    since = a.since if not re.fullmatch(r"\d+[smhd]", a.since) else f"-{a.since}"
+    hist = a.history or a.since
+    hist_since = None
+    if hist:
+        hist_since = f"-{hist}" if re.fullmatch(r"\d+[smhd]", hist) else hist
 
     use_real_user_session()
     r = Report()
@@ -355,15 +535,25 @@ def main(argv=None):
     check_steamvr(r)
     check_passthrough(r, vr)
     check_tools(r, vr)
+    check_eye(r, vr)
+    check_audio(r)
     check_mic(r)
-    check_logs(r, since)
+    if not a.no_network:
+        check_network(r)
+    check_logs(r)
+    if hist_since:
+        check_history(r, hist_since)
 
-    worst = max((RANK[i["level"]] for i in r.items), default=0)
+    worst = max((RANK[i["level"]] for i in r.items if not i["data"].get("past")), default=0)
     if a.json:
         print(json.dumps({"version": VERSION, "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                           "worst": [OK, WARN, ERROR][worst], "items": r.items}, ensure_ascii=False, indent=2))
     else:
-        render(r, color=not a.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR"), since=a.since)
+        color = not a.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        if a.verbose:
+            render(r, color, hist)
+        else:
+            render_brief(r, color, hist)
     return worst
 
 
