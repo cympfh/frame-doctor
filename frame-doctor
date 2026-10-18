@@ -405,14 +405,18 @@ def unit_started(unit):
     return int(m.group(1)) if m else None
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")   # ログに入っている色の指定
+
+
 def error_lines(unit, since):
     rc, out = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "--no-pager", "-o", "cat"],
                   timeout=20)
+    out = ANSI.sub("", out)
     lines = [l for l in out.splitlines() if l and not l.startswith("-- ")]
     errs = [l for l in lines if looks_like_error(l)]
     _, prio = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "-p", "err",
                    "--no-pager", "-o", "cat"], timeout=20)
-    prio_lines = [l for l in prio.splitlines() if l and not l.startswith("-- ")]
+    prio_lines = [l for l in ANSI.sub("", prio).splitlines() if l and not l.startswith("-- ")]
     return errs + [l for l in prio_lines if l not in errs]
 
 

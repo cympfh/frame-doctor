@@ -206,6 +206,10 @@ class HelperTest(unittest.TestCase):
         self.assertFalse(fd.looks_like_error("[VR] SetOverlayFlag -> VROverlayError_None（読み返し: VROverlayError_None, true）"))
         self.assertFalse(fd.looks_like_error("finished, errors=0"))
 
+    def test_ansi_stripped(self):
+        with mock.patch.object(fd, "run", side_effect=lambda cmd, **k: (0, "" if "-p" in cmd else "\x1b[0;93m2026 [W:onnxruntime] GPU device discovery failed\x1b[m")):
+            self.assertEqual(fd.error_lines("steamvr", "@0"), ["2026 [W:onnxruntime] GPU device discovery failed"])
+
     def test_size(self):
         self.assertEqual(fd.size(224 * 1024 * 1024), "235 MB")
         self.assertEqual(fd.size(6.3e9), "6.3 GB")
