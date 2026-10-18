@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""frame-doctor: Steam Frame の健康チェック。読むだけで、何も変えない。Python 3 の標準ライブラリだけで動く。"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local/bin")
+OPT = os.path.join(HOME, ".local/opt")
+UNIT_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd/user")
+VRCMD_DIR = "/opt/steamvr/bin/linuxarm64"
+ROOM_VIEW_STYLES = {0: "既定", 1: "輪郭 A", 2: "輪郭 B", 3: "半透明の映像", 4: "不透明な映像"}
+
+# (表示名, unit, バージョンの取り方, プロセス名)
+TOOLS = [
+    ("frameeyeosc", "frameeyeosc", ("bin", "frameeyeosc-panel"), "frameeyeosc"),
+    ("frameeyeosc パネル", "frameeyeosc-panel", ("bin", "frameeyeosc-panel"), "frameeyeosc-pan"),
+    ("frame-aux-shortcuts", "frame-aux-shortcuts", ("bin", "frame-aux-shortcuts"), "frame-aux-short"),
+    ("frame-mic-tuner", "frame-mic-tuner", ("bin", "frame-mic-tuner"), "frame-mic-tuner"),
+    ("frame-perf-overlay", "frame-perf-overlay", ("bin", "frame-perf-overlay"), "frame-perf-over"),
+    ("frame-vitals-osc", "frame-vitals-osc", ("py", "frame-vitals-osc/frame-vitals-osc.py"), None),
+    ("frame-gaze-gestures", "frame-gaze-gestures", ("py", "frame-gaze-gestures/frame-gaze-gestures.py"), None),
+]
+
+OK, INFO, WARN, ERROR = "OK", "INFO", "WARN", "ERROR"
+RANK = {OK: 0, INFO: 0, WARN: 1, ERROR: 2}
+
+
+def use_real_user_session():
+    """デスクトップモードや SSH でも systemctl --user / journalctl --user が本来のセッションに届くようにする。"""
+    real = f"/run/user/{os.getuid()}"
+    cur = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not os.path.exists(os.path.join(cur, "systemd/private")) and os.path.exists(os.path.join(real, "systemd/private")):
+        os.environ["XDG_RUNTIME_DIR"] = real
+        if os.path.exists(os.path.join(real, "bus")):
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={real}/bus"
+
+
+def run(cmd, timeout=10, cwd=None, env=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env=dict(os.environ, **(env or {})))
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, str(e)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+class Report:
+    def __init__(self):
+        self.items = []
+
+    def add(self, section, level, title, message, **data):
+        self.items.append({"section": section, "level": level, "title": title, "message": message, "data": data})
+
+
+# ---------------------------------------------------------------- 本体のようす
+def check_temps(r, warn_c, error_c):
+    zones = []
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        t, v = read(z + "/type") or "", read(z + "/temp")
+        if v and v.lstrip("-").isdigit():
+            zones.append((t, int(v) / 1000.0))
+    soc = [(t, v) for t, v in zones if re.match(r"^(cpu|cpuss|gpuss)", t)]
+    if not soc:
+        r.add("本体", INFO, "温度", "温度センサーが見つかりません")
+        return
+    name, hot = max(soc, key=lambda x: x[1])
+    gpu = max((v for t, v in soc if t.startswith("gpuss")), default=None)
+    level = ERROR if hot >= error_c else WARN if hot >= warn_c else OK
+    msg = f"SoC 最高 {hot:.1f} °C（{name}）"
+    if gpu is not None:
+        msg += f"、GPU {gpu:.1f} °C"
+    r.add("本体", level, "温度", msg, hottest_c=hot, hottest_zone=name, gpu_c=gpu)
+
+
+def check_throttling(r):
+    limited = []
+    for c in glob.glob("/sys/class/thermal/cooling_device*"):
+        t, cur = read(c + "/type") or "", read(c + "/cur_state")
+        if (t.startswith("cpufreq") or "gpu" in t) and cur and cur.isdigit() and int(cur) > 0:
+            limited.append(f"{t} {cur}/{read(c + '/max_state')}")
+    capped = []
+    for p in sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*")):
+        mx, hw = read(p + "/scaling_max_freq"), read(p + "/cpuinfo_max_freq")
+        if mx and hw and mx.isdigit() and hw.isdigit() and int(mx) < int(hw):
+            capped.append(f"{os.path.basename(p)} {int(mx) // 1000}/{int(hw) // 1000} MHz")
+    if limited or capped:
+        r.add("本体", WARN, "熱による制限", "クロックが下げられています: " + "、".join(limited + capped),
+              cooling=limited, capped=capped)
+    else:
+        r.add("本体", OK, "熱による制限", "制限なし（CPU・GPU とも最大クロックまで使えます）", cooling=[], capped=[])
+
+
+def check_battery(r):
+    bats = [b for b in glob.glob("/sys/class/power_supply/*") if read(b + "/type") == "Battery"]
+    if not bats:
+        r.add("本体", INFO, "バッテリー", "バッテリーが見つかりません")
+        return
+    b = bats[0]
+    cap, status, temp = read(b + "/capacity"), read(b + "/status"), read(b + "/temp")
+    capn = int(cap) if cap and cap.isdigit() else None
+    charging = status in ("Charging", "Full")
+    ja = {"Charging": "充電中", "Discharging": "放電中", "Full": "満充電", "Not charging": "充電していない"}.get(status, status)
+    level = OK
+    if capn is not None and not charging:
+        level = ERROR if capn < 10 else WARN if capn < 20 else OK
+    msg = f"{cap}%（{ja}）"
+    if temp and temp.lstrip("-").isdigit():
+        msg += f"、{int(temp) / 10:.1f} °C"
+    r.add("本体", level, "バッテリー", msg, percent=capn, status=status)
+
+
+def check_disks(r):
+    seen = set()
+    for mnt, label in (("/", "システム"), ("/home", "ホーム"), ("/var", "/var")):
+        try:
+            st = os.statvfs(mnt)
+        except OSError:
+            continue
+        if st.f_fsid in seen:
+            continue
+        seen.add(st.f_fsid)
+        total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+        pct = 100.0 * free / total if total else 0
+        level = ERROR if pct < 5 else WARN if pct < 10 else OK
+        r.add("本体", level, f"空き容量（{label}）", f"{free / 1e9:.1f} GB 空き / {total / 1e9:.0f} GB（{pct:.0f}%）",
+              mount=mnt, free_bytes=free, total_bytes=total)
+
+
+def check_uptime(r):
+    up = read("/proc/uptime")
+    if not up:
+        return
+    secs = float(up.split()[0])
+    boot = datetime.datetime.fromtimestamp(time.time() - secs)
+    d, rem = divmod(int(secs), 86400)
+    h, m = rem // 3600, rem % 3600 // 60
+    r.add("本体", INFO, "起動してから", f"{d} 日 {h} 時間 {m} 分（最後の起動 {boot:%m/%d %H:%M}）",
+          uptime_s=secs, boot=boot.isoformat(timespec="seconds"))
+
+
+# ---------------------------------------------------------------- SteamVR とツール
+def unit_state(unit):
+    _, active = run(["systemctl", "--user", "is-active", unit + ".service"], timeout=5)
+    _, enabled = run(["systemctl", "--user", "is-enabled", unit + ".service"], timeout=5)
+    return active.splitlines()[-1] if active else "unknown", enabled.splitlines()[-1] if enabled else "unknown"
+
+
+def steamvr_running():
+    active, _ = unit_state("steamvr")
+    rc, _ = run(["pgrep", "-x", "vrserver"], timeout=5)
+    return active == "active" or rc == 0
+
+
+def check_steamvr(r):
+    active, _ = unit_state("steamvr")
+    rc, _ = run(["pgrep", "-x", "vrserver"], timeout=5)
+    if active == "active" or rc == 0:
+        r.add("SteamVR", OK, "SteamVR", "動いています", service=active, vrserver=rc == 0)
+    else:
+        r.add("SteamVR", WARN, "SteamVR", "動いていません（デスクトップモードなら正常）", service=active, vrserver=False)
+
+
+def tool_version(how):
+    kind, rel = how
+    if kind == "bin":
+        path = os.path.join(BIN, rel)
+        if not os.access(path, os.X_OK):
+            return None, False
+        rc, out = run([path, "--version"], timeout=5)
+    else:
+        path = os.path.join(OPT, rel)
+        if not os.path.exists(path):
+            return None, False
+        rc, out = run([sys.executable, path, "--version"], timeout=5)
+    line = out.splitlines()[0] if out else ""
+    m = re.search(r"(\d+\.\d+\.\d+\S*)", line)
+    return (m.group(1) if m else None), True
+
+
+def stale_processes(proc):
+    """古い版のまま動いているプロセス（更新でファイルが置き換わった）の PID。"""
+    if not proc:
+        return []
+    rc, out = run(["pgrep", "-x", proc], timeout=5)
+    stale = []
+    for pid in out.split() if rc == 0 else []:
+        try:
+            if os.readlink(f"/proc/{pid}/exe").endswith(" (deleted)"):
+                stale.append(int(pid))
+        except OSError:
+            pass
+    return stale
+
+
+def check_tools(r, vr_running):
+    for label, unit, how, proc in TOOLS:
+        ver, installed = tool_version(how)
+        unit_file = os.path.exists(os.path.join(UNIT_DIR, unit + ".service"))
+        if not installed and not unit_file:
+            r.add("ツール", INFO, label, "入っていません", installed=False)
+            continue
+        active, enabled = unit_state(unit)
+        auto = {"enabled": "自動起動オン", "disabled": "自動起動オフ"}.get(enabled, f"自動起動 {enabled}")
+        running = active == "active"
+        if not running and proc:
+            running = run(["pgrep", "-x", proc], timeout=5)[0] == 0   # ダッシュボードの＋から起動したもの
+        stale = stale_processes(proc)
+        msg = f"{ver or '?'}、{'動作中' if running else '停止中'}、{auto}"
+        level = OK
+        if stale:
+            level = WARN
+            msg += "。古い版のまま動いています（終了するか SteamVR を再起動すると新しい版になります）"
+        elif enabled == "enabled" and vr_running and not running:
+            level = WARN
+            msg += "。SteamVR が動いているのに止まっています"
+        r.add("ツール", level, label, msg, version=ver, active=active, enabled=enabled, running=running, stale_pids=stale)
+
+
+def check_mic(r):
+    if not shutil.which("wpctl"):
+        r.add("マイク", INFO, "マイクのフィルター", "wpctl がありません")
+        return
+    vals = {}
+    for key, ja in (("frame-mic.echo-cancel", "エコー除去"), ("frame-mic.noise-suppression", "ノイズ除去")):
+        rc, out = run(["wpctl", "settings", key], timeout=5)
+        m = re.search(r"Value:\s*(\S+)", out)
+        vals[key] = m.group(1) if (rc == 0 and m) else None
+        if vals[key] is None:
+            r.add("マイク", INFO, ja, "設定がありません（frame-mic-tuner が入っていない？）", key=key, value=None)
+        else:
+            r.add("マイク", INFO, ja, {"true": "オン", "false": "オフ"}.get(vals[key], vals[key]), key=key, value=vals[key])
+
+
+def check_passthrough(r, vr_running):
+    vrcmd = os.path.join(VRCMD_DIR, "vrcmd")
+    if not os.path.exists(vrcmd):
+        r.add("SteamVR", INFO, "パススルーの表示", "vrcmd が見つかりません")
+        return
+    if not vr_running:
+        r.add("SteamVR", INFO, "パススルーの表示", "SteamVR が止まっているので読めません")
+        return
+    rc, out = run(["./vrcmd", "--settings-int", "camera.roomViewStyle"], timeout=10, cwd=VRCMD_DIR,
+                  env={"LD_LIBRARY_PATH": "."})
+    m = re.search(r"camera\.roomViewStyle\s*=\s*(-?\d+)", out)
+    if not m:
+        r.add("SteamVR", INFO, "パススルーの表示", "読めませんでした", output=out[-200:])
+        return
+    v = int(m.group(1))
+    r.add("SteamVR", INFO, "パススルーの表示", f"roomViewStyle = {v}（{ROOM_VIEW_STYLES.get(v, '不明')}）", value=v)
+
+
+ERROR_PATTERN = re.compile(r"error|failed|panic|fatal|エラー|失敗", re.I)
+
+
+def check_logs(r, since):
+    if not shutil.which("journalctl"):
+        r.add("ログ", INFO, "ログ", "journalctl がありません")
+        return
+    units = ["steamvr"] + [u for _, u, _, _ in TOOLS]
+    for unit in units:
+        if unit != "steamvr" and not os.path.exists(os.path.join(UNIT_DIR, unit + ".service")):
+            continue
+        rc, out = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "--no-pager", "-o", "cat"],
+                      timeout=20)
+        if rc != 0 and not out:
+            continue
+        lines = [l for l in out.splitlines() if l and not l.startswith("-- ")]
+        errs = [l for l in lines if ERROR_PATTERN.search(l)]
+        _, prio = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "-p", "err",
+                         "--no-pager", "-o", "cat"], timeout=20)
+        prio_lines = [l for l in prio.splitlines() if l and not l.startswith("-- ")]
+        n = len(errs) + len([l for l in prio_lines if l not in errs])   # 重要度 err 以上の行と、エラーらしい言葉を含む行
+        if n:
+            last = (prio_lines or errs)[-1]
+            r.add("ログ", WARN, unit, f"エラーらしい行が {n} 行（最後: {last[:120]}）", count=n, last=last)
+        else:
+            r.add("ログ", OK, unit, "エラーなし", count=0)
+
+
+# ---------------------------------------------------------------- 表示
+def render(report, color, since):
+    c = {"OK": "\033[32m", "INFO": "\033[36m", "WARN": "\033[33m", "ERROR": "\033[31m", "b": "\033[1m", "d": "\033[2m", "0": "\033[0m"}
+    if not color:
+        c = {k: "" for k in c}
+    now = datetime.datetime.now().astimezone()
+    print(f"{c['b']}frame-doctor {VERSION} — Steam Frame の健康チェック（{now:%Y-%m-%d %H:%M} {now.tzname()}）{c['0']}")
+    section = None
+    for it in report.items:
+        if it["section"] != section:
+            section = it["section"]
+            extra = f"（直近 {since}）" if section == "ログ" else ""
+            print(f"\n{c['b']}■ {section}{extra}{c['0']}")
+        lv = it["level"]
+        print(f"  {c[lv]}[{lv:^5}]{c['0']} {it['title']}: {it['message']}")
+    counts = {k: sum(1 for i in report.items if i["level"] == k) for k in (OK, INFO, WARN, ERROR)}
+    print(f"\n{c['b']}まとめ:{c['0']} {c['OK']}OK {counts[OK]}{c['0']} / {c['INFO']}INFO {counts[INFO]}{c['0']} / "
+          f"{c['WARN']}WARN {counts[WARN]}{c['0']} / {c['ERROR']}ERROR {counts[ERROR]}{c['0']}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Steam Frame の健康チェック（読むだけ）")
+    ap.add_argument("--json", action="store_true", help="JSON で出す")
+    ap.add_argument("--no-color", action="store_true", help="色を付けない")
+    ap.add_argument("--since", default="24h", help="ログを見る範囲（journalctl の --since。既定 24h）")
+    ap.add_argument("--warn-temp", type=float, default=80.0, help="温度の注意ライン（°C）")
+    ap.add_argument("--error-temp", type=float, default=90.0, help="温度のエラーライン（°C）")
+    ap.add_argument("--version", action="version", version=f"frame-doctor {VERSION}")
+    a = ap.parse_args(argv)
+    since = a.since if not re.fullmatch(r"\d+[smhd]", a.since) else f"-{a.since}"
+
+    use_real_user_session()
+    r = Report()
+    check_temps(r, a.warn_temp, a.error_temp)
+    check_throttling(r)
+    check_battery(r)
+    check_disks(r)
+    check_uptime(r)
+    vr = steamvr_running()
+    check_steamvr(r)
+    check_passthrough(r, vr)
+    check_tools(r, vr)
+    check_mic(r)
+    check_logs(r, since)
+
+    worst = max((RANK[i["level"]] for i in r.items), default=0)
+    if a.json:
+        print(json.dumps({"version": VERSION, "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                          "worst": [OK, WARN, ERROR][worst], "items": r.items}, ensure_ascii=False, indent=2))
+    else:
+        render(r, color=not a.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR"), since=a.since)
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())
