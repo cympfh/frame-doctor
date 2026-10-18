@@ -48,3 +48,5 @@ curl -fsSL https://raw.githubusercontent.com/cympfh/frame-doctor/main/install.sh
 - 何を見ているかは [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 
 </details>
+
+ほかの Steam Frame 用ツール: [frame-tools](https://github.com/cympfh/frame-tools)
