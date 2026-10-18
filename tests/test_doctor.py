@@ -106,5 +106,21 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(fd.size(997e9), "997 GB")
 
 
+
+class ToolVersionTest(unittest.TestCase):
+    def test_opt_binary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "vrc-wrist-notifier"))
+            exe = os.path.join(d, "vrc-wrist-notifier", "wrist-toast")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\necho 'wrist-toast 0.1.0'\n")
+            os.chmod(exe, 0o755)
+            with mock.patch.object(fd, "OPT", d):
+                self.assertEqual(fd.tool_version(("opt", "vrc-wrist-notifier/wrist-toast")), ("0.1.0", True))
+                self.assertEqual(fd.tool_version(("opt", "nothing/here")), (None, False))
+        self.assertIn("vrc-wrist-notifier", [t[0] for t in fd.TOOLS])
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()
