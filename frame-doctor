@@ -20,15 +20,15 @@ UNIT_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, 
 VRCMD_DIR = "/opt/steamvr/bin/linuxarm64"
 ROOM_VIEW_STYLES = {0: "既定", 1: "輪郭 A", 2: "輪郭 B", 3: "半透明の映像", 4: "不透明な映像"}
 
-# (表示名, unit, バージョンの取り方, プロセス名)
+# (表示名, unit, バージョンの取り方, プロセス名, パネルの「閉じる」で終われるもの)
 TOOLS = [
-    ("frameeyeosc", "frameeyeosc", ("bin", "frameeyeosc-panel"), "frameeyeosc"),
-    ("frameeyeosc パネル", "frameeyeosc-panel", ("bin", "frameeyeosc-panel"), "frameeyeosc-pan"),
-    ("frame-aux-shortcuts", "frame-aux-shortcuts", ("bin", "frame-aux-shortcuts"), "frame-aux-short"),
-    ("frame-mic-tuner", "frame-mic-tuner", ("bin", "frame-mic-tuner"), "frame-mic-tuner"),
-    ("frame-perf-overlay", "frame-perf-overlay", ("bin", "frame-perf-overlay"), "frame-perf-over"),
-    ("frame-vitals-osc", "frame-vitals-osc", ("py", "frame-vitals-osc/frame-vitals-osc.py"), None),
-    ("frame-gaze-gestures", "frame-gaze-gestures", ("py", "frame-gaze-gestures/frame-gaze-gestures.py"), None),
+    ("frameeyeosc", "frameeyeosc", ("bin", "frameeyeosc-panel"), "frameeyeosc", False),
+    ("frameeyeosc パネル", "frameeyeosc-panel", ("bin", "frameeyeosc-panel"), "frameeyeosc-pan", True),
+    ("frame-aux-shortcuts", "frame-aux-shortcuts", ("bin", "frame-aux-shortcuts"), "frame-aux-short", False),
+    ("frame-mic-tuner", "frame-mic-tuner", ("bin", "frame-mic-tuner"), "frame-mic-tuner", True),
+    ("frame-perf-overlay", "frame-perf-overlay", ("bin", "frame-perf-overlay"), "frame-perf-over", True),
+    ("frame-vitals-osc", "frame-vitals-osc", ("py", "frame-vitals-osc/frame-vitals-osc.py"), None, False),
+    ("frame-gaze-gestures", "frame-gaze-gestures", ("py", "frame-gaze-gestures/frame-gaze-gestures.py"), None, False),
 ]
 
 OK, INFO, WARN, ERROR = "OK", "INFO", "WARN", "ERROR"
@@ -127,6 +127,13 @@ def check_battery(r):
     r.add("本体", level, "バッテリー", msg, percent=capn, status=status)
 
 
+def size(n):
+    for unit, k in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6)):
+        if n >= k:
+            return f"{n / k:.1f} {unit}" if n < 10 * k else f"{n / k:.0f} {unit}"
+    return f"{n} B"
+
+
 def check_disks(r):
     seen = set()
     for mnt, label in (("/", "システム"), ("/home", "ホーム"), ("/var", "/var")):
@@ -140,7 +147,7 @@ def check_disks(r):
         total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
         pct = 100.0 * free / total if total else 0
         level = ERROR if pct < 5 else WARN if pct < 10 else OK
-        r.add("本体", level, f"空き容量（{label}）", f"{free / 1e9:.1f} GB 空き / {total / 1e9:.0f} GB（{pct:.0f}%）",
+        r.add("本体", level, f"空き容量（{label}）", f"{size(free)} 空き / {size(total)}（{pct:.0f}%）",
               mount=mnt, free_bytes=free, total_bytes=total)
 
 
@@ -211,7 +218,7 @@ def stale_processes(proc):
 
 
 def check_tools(r, vr_running):
-    for label, unit, how, proc in TOOLS:
+    for label, unit, how, proc, closable in TOOLS:
         ver, installed = tool_version(how)
         unit_file = os.path.exists(os.path.join(UNIT_DIR, unit + ".service"))
         if not installed and not unit_file:
@@ -229,8 +236,12 @@ def check_tools(r, vr_running):
             level = WARN
             msg += "。古い版のまま動いています（終了するか SteamVR を再起動すると新しい版になります）"
         elif enabled == "enabled" and vr_running and not running:
-            level = WARN
-            msg += "。SteamVR が動いているのに止まっています"
+            if closable:
+                level = INFO
+                msg += "。閉じられています（ダッシュボードの＋から開けます。次の SteamVR 起動で自動で開きます）"
+            else:
+                level = WARN
+                msg += "。SteamVR が動いているのに止まっています"
         r.add("ツール", level, label, msg, version=ver, active=active, enabled=enabled, running=running, stale_pids=stale)
 
 
@@ -268,13 +279,19 @@ def check_passthrough(r, vr_running):
 
 
 ERROR_PATTERN = re.compile(r"error|failed|panic|fatal|エラー|失敗", re.I)
+# 「エラーなし」を表す言い方（VROverlayError_None、errors=0 など）は数えない
+NOT_ERROR = re.compile(r"\w*Error_None\b|\bno errors?\b|\berrors?[=: ]+0\b|error[=: ]+(none|null)\b", re.I)
+
+
+def looks_like_error(line):
+    return bool(ERROR_PATTERN.search(NOT_ERROR.sub("", line)))
 
 
 def check_logs(r, since):
     if not shutil.which("journalctl"):
         r.add("ログ", INFO, "ログ", "journalctl がありません")
         return
-    units = ["steamvr"] + [u for _, u, _, _ in TOOLS]
+    units = ["steamvr"] + [t[1] for t in TOOLS]
     for unit in units:
         if unit != "steamvr" and not os.path.exists(os.path.join(UNIT_DIR, unit + ".service")):
             continue
@@ -283,7 +300,7 @@ def check_logs(r, since):
         if rc != 0 and not out:
             continue
         lines = [l for l in out.splitlines() if l and not l.startswith("-- ")]
-        errs = [l for l in lines if ERROR_PATTERN.search(l)]
+        errs = [l for l in lines if looks_like_error(l)]
         _, prio = run(["journalctl", "--user", "-u", unit + ".service", "--since", since, "-p", "err",
                          "--no-pager", "-o", "cat"], timeout=20)
         prio_lines = [l for l in prio.splitlines() if l and not l.startswith("-- ")]

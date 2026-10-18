@@ -93,5 +93,18 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(r.items[0]["data"]["count"], 1)
 
 
+class HelperTest(unittest.TestCase):
+    def test_error_words(self):
+        self.assertTrue(fd.looks_like_error("failed to open device"))
+        self.assertTrue(fd.looks_like_error("Error: no such file"))
+        self.assertFalse(fd.looks_like_error("[VR] SetOverlayFlag -> VROverlayError_None（読み返し: VROverlayError_None, true）"))
+        self.assertFalse(fd.looks_like_error("finished, errors=0"))
+
+    def test_size(self):
+        self.assertEqual(fd.size(224 * 1024 * 1024), "235 MB")
+        self.assertEqual(fd.size(6.3e9), "6.3 GB")
+        self.assertEqual(fd.size(997e9), "997 GB")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
