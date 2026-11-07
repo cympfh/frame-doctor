@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""frame-doctor: Steam Frame の健康チェック。読むだけで、何も変えない。Python 3 の標準ライブラリだけで動く。
-いまの状態だけで判定する（過去のログは、今も同じエラーが出ているときだけ数える）。"""
+"""frame-doctor: Steam Frame の健康チェック。既定は読むだけで、何も変えない。Python 3 の標準ライブラリだけで動く。
+いまの状態だけで判定する（過去のログは、今も同じエラーが出ているときだけ数える）。
+--fix を付けたときだけ、画面の UI が落ちていたら SteamVR を再起動する。"""
 import argparse
 import datetime
 import glob
@@ -15,7 +16,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HOME = os.path.expanduser("~")
 BIN = os.path.join(HOME, ".local/bin")
 OPT = os.path.join(HOME, ".local/opt")
@@ -189,21 +190,206 @@ def unit_state(unit):
     return active.splitlines()[-1] if active else "unknown", enabled.splitlines()[-1] if enabled else "unknown"
 
 
+def pgrep_exact(name):
+    """プロセスがあるか。True=いる、False=いない、None=不明（タイムアウトや pgrep の失敗）。"""
+    rc, _ = run(["pgrep", "-x", name], timeout=5)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
 def steamvr_running():
     active, _ = unit_state("steamvr")
-    rc, _ = run(["pgrep", "-x", "vrserver"], timeout=5)
-    return active == "active" or rc == 0
+    return active == "active" or pgrep_exact("vrserver") is True
 
 
-def check_steamvr(r):
+STEAM_BOOTSTRAP_LOGS = (
+    os.path.join(HOME, ".local/share/Steam/logs/bootstrap_log.txt"),
+    os.path.join(HOME, ".steam/steam/logs/bootstrap_log.txt"),
+)
+UPDATE_BUSY = re.compile(r"Downloading|Installing update|Extracting package|Updating Steam", re.I)
+UPDATE_IDLE = re.compile(r"Nothing to do|Verification complete", re.I)
+VRWEBHELPER_DUMP = re.compile(r"vrwebhelper.*dumped core|\(vrwebhelper\).*dumped core", re.I)
+BOOTSTRAP_RECENT_SECONDS = 600
+
+
+def bootstrap_log_updating(text, mtime, now):
+    """Steam の bootstrap_log から、いま更新中そうかを判定する（純粋関数。テスト用）。"""
+    if not text or mtime is None or now - mtime > BOOTSTRAP_RECENT_SECONDS:
+        return False
+    last = None
+    for line in text.splitlines():
+        if UPDATE_BUSY.search(line) or UPDATE_IDLE.search(line):
+            last = line
+    return bool(last) and bool(UPDATE_BUSY.search(last)) and not bool(UPDATE_IDLE.search(last))
+
+
+def steam_client_updating(now=None):
+    """Steam クライアントが更新中か。True / False / None（ログが読めず不明）。"""
+    now = now or time.time()
+    seen = set()
+    readable = False
+    for path in STEAM_BOOTSTRAP_LOGS:
+        try:
+            st = os.stat(path)
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            with open(path, errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        readable = True
+        if bootstrap_log_updating(text, st.st_mtime, now):
+            return True
+    return None if not readable else False
+
+
+def steamos_updating():
+    """SteamOS の更新プロセスがあるか。True / False / None（pgrep 失敗で不明）。"""
+    return pgrep_exact("steamos-update")
+
+
+def update_in_progress(now=None):
+    """(更新中の理由リスト, 判定できないか)。判定できないときは --fix しない。"""
+    steam = steam_client_updating(now=now)
+    osu = steamos_updating()
+    reasons = []
+    if steam is True:
+        reasons.append("Steam の更新中")
+    if osu is True:
+        reasons.append("SteamOS の更新中")
+    return reasons, (steam is None or osu is None)
+
+
+def vrwebhelper_dumped_since(since_unix):
+    """今回の SteamVR 起動以降に vrwebhelper のコアダンプがあるか。古いダンプは見ない。"""
+    if since_unix is None:
+        return False
+    since = f"@{int(since_unix)}"
+    cmds = (
+        ["journalctl", "--user", "--since", since, "--no-pager", "-o", "cat", "-g", "vrwebhelper"],
+        ["journalctl", "--since", since, "--no-pager", "-o", "cat", "-g", "vrwebhelper"],
+    )
+    for cmd in cmds:
+        rc, out = run(cmd, timeout=15)
+        out = ANSI.sub("", out or "")
+        if any(VRWEBHELPER_DUMP.search(line) for line in out.splitlines()):
+            return True
+    return False
+
+
+def diagnose_steamvr_ui(now=None):
+    """SteamVR が動いている前提で、画面 UI（vrwebhelper）が今生きているか。
+    起動直後の 1 分は、まだ立ち上がっていないことがあるので異常にしない。
+    起動時刻が取れないとき、プロセス確認が失敗したときは異常と断定しない（--fix もしない）。
+    プロセスが生きていれば、過去のコアダンプだけでは異常にしない。
+    """
+    now = now or time.time()
+    helper = pgrep_exact("vrwebhelper")
+    started = unit_started("steamvr")
+    young = started is not None and (now - started) < STARTUP_GRACE_SECONDS
+    dumped = vrwebhelper_dumped_since(started) if started is not None else False
+    data = {"helper_running": helper, "dumped": dumped, "young": young, "started": started,
+            "check_note": None, "skip_reason": None}
+    if helper is True:
+        return dict(data, ok=True, problem=None)
+    if helper is None:
+        return dict(data, ok=True, problem=None,
+                    check_note="画面のUIを確認できませんでした",
+                    skip_reason="画面のUIを確認できないので、再起動しませんでした。")
+    if started is None:
+        return dict(data, ok=True, problem=None,
+                    check_note="SteamVR の起動時刻が取れないので、画面UIは判定していません",
+                    skip_reason="SteamVR の起動時刻が取れないので、再起動しませんでした。")
+    if young:
+        return dict(data, ok=True, problem=None)
+    problem = "画面のUIが落ちています"
+    if dumped:
+        problem = "画面のUIが落ちています（今回の起動以降にコアダンプ）"
+    return dict(data, ok=False, problem=problem)
+
+
+def check_steamvr(r, now=None):
     active, _ = unit_state("steamvr")
-    rc, _ = run(["pgrep", "-x", "vrserver"], timeout=5)
-    if active == "active" or rc == 0:
-        r.add("SteamVR", OK, "SteamVR", "動いています", brief="SteamVR", service=active, vrserver=rc == 0)
-    else:
+    server = pgrep_exact("vrserver")
+    extra_base = {"service": active, "vrserver": server is True}
+    if active != "active" and server is None:
+        r.add("SteamVR", INFO, "SteamVR", "SteamVR の状態を確認できませんでした", brief="SteamVR",
+              reason="SteamVR の状態を確認できませんでした", **extra_base)
+        return
+    if not (active == "active" or server is True):
         # デスクトップモードでは止まっているのが普通なので、警告にはしない
         r.add("SteamVR", INFO, "SteamVR", "動いていません（デスクトップモードなら正常）", brief="SteamVR", reason="停止中",
-              service=active, vrserver=False)
+              **extra_base)
+        return
+    ui = diagnose_steamvr_ui(now=now)
+    extra = {**extra_base, **{k: ui[k] for k in ("helper_running", "dumped", "young")}}
+    if ui.get("check_note"):
+        r.add("SteamVR", INFO, "SteamVR", ui["check_note"], brief="SteamVR",
+              reason=ui["check_note"], **extra)
+    elif ui["ok"]:
+        r.add("SteamVR", OK, "SteamVR", "動いています", brief="SteamVR", **extra)
+    else:
+        r.add("SteamVR", WARN, "SteamVR", f"動いていますが、{ui['problem']}", brief="SteamVR",
+              reason=ui["problem"], **extra)
+
+
+def apply_steamvr_ui_fix(now=None, wait=True, wait_seconds=45):
+    """画面 UI が落ちていれば steamvr.service だけ再起動する。
+    更新中、または判定できないときはしない。frame-video-player など他のユニットは触らない。
+    steamvr.service が active のときだけ restart する（vrserver だけ動いているときは起動しない）。
+    戻り値: {did_restart, recovered, message}
+    """
+    active, _ = unit_state("steamvr")
+    if active != "active":
+        if not steamvr_running():
+            return {"did_restart": False, "recovered": False,
+                    "message": "SteamVR が止まっているので、再起動しませんでした。"}
+        return {"did_restart": False, "recovered": False,
+                "message": "steamvr.service が動いていないので、再起動しませんでした。"}
+    ui = diagnose_steamvr_ui(now=now)
+    if ui.get("skip_reason"):
+        return {"did_restart": False, "recovered": False, "message": ui["skip_reason"]}
+    if ui["ok"]:
+        return {"did_restart": False, "recovered": True,
+                "message": "画面のUIは動いているので、SteamVR は再起動しませんでした。"}
+    busy, unknown = update_in_progress(now=now)
+    if unknown:
+        return {"did_restart": False, "recovered": False,
+                "message": "更新中かどうかを確認できないので、SteamVR は再起動しませんでした。"}
+    if busy:
+        return {"did_restart": False, "recovered": False,
+                "message": "、".join(busy) + "なので、SteamVR は再起動しませんでした。"}
+    rc, out = run(["systemctl", "--user", "restart", "steamvr.service"], timeout=90)
+    if rc != 0:
+        detail = (out or "").strip().replace("\n", " ")[:160]
+        return {"did_restart": False, "recovered": False,
+                "message": f"SteamVR の再起動に失敗しました{('（' + detail + '）') if detail else '。'}"}
+    recovered = False
+    if wait:
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if steamvr_running() and pgrep_exact("vrwebhelper"):
+                recovered = True
+                break
+            time.sleep(2)
+        else:
+            recovered = steamvr_running() and pgrep_exact("vrwebhelper")
+    else:
+        recovered = steamvr_running() and pgrep_exact("vrwebhelper")
+    if recovered:
+        msg = ("SteamVR を再起動しました（本体は再起動していません。"
+               "Steam と gamescope も一緒に立ち上がり直していることがあります）。"
+               "画面のUIは戻っています。ヘッドセットにホームが見えるか確認してください。")
+    else:
+        msg = ("SteamVR を再起動しました（本体は再起動していません。"
+               "Steam と gamescope も一緒に立ち上がり直していることがあります）。"
+               "画面のUIはまだ確認できません。ヘッドセットを見てください。")
+    return {"did_restart": True, "recovered": recovered, "message": msg}
 
 
 def tool_version(how):
@@ -511,8 +697,10 @@ def render(report, color, history_since=None):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Steam Frame の健康チェック（読むだけ）。いまの状態だけで判定します")
+    ap = argparse.ArgumentParser(description="Steam Frame の健康チェック。既定は読むだけ。いまの状態だけで判定します")
     ap.add_argument("-v", "--verbose", action="store_true", help="くわしく（各項目の値も出す）")
+    ap.add_argument("--fix", action="store_true",
+                    help="画面のUIが落ちていたら SteamVR だけ再起動する（更新中はしない。本体は再起動しない）")
     ap.add_argument("--json", action="store_true", help="JSON で出す")
     ap.add_argument("--history", nargs="?", const="24h", metavar="範囲",
                     help="過去のログのエラーも参考として出す（既定 24h。判定には使わない）")
@@ -548,16 +736,31 @@ def main(argv=None):
     if hist_since:
         check_history(r, hist_since)
 
+    fix = None
+    if a.fix:
+        fix = apply_steamvr_ui_fix()
+        if fix.get("recovered"):
+            for it in r.items:
+                if it["title"] == "SteamVR" and it["level"] == WARN and it.get("brief") == "SteamVR":
+                    it["level"] = OK
+                    it["reason"] = None
+                    it["message"] = "動いています（SteamVR を再起動して画面のUIを戻しました）"
+
     worst = max((RANK[i["level"]] for i in r.items if not i["data"].get("past")), default=0)
     if a.json:
-        print(json.dumps({"version": VERSION, "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                          "worst": [OK, WARN, ERROR][worst], "items": r.items}, ensure_ascii=False, indent=2))
+        payload = {"version": VERSION, "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                   "worst": [OK, WARN, ERROR][worst], "items": r.items}
+        if fix is not None:
+            payload["fix"] = fix
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         color = not a.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         if a.verbose:
             render(r, color, hist)
         else:
             render_brief(r, color, hist)
+        if fix is not None:
+            print(f"直し：{fix['message']}")
     return worst
 
 
