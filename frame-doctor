@@ -191,13 +191,18 @@ def unit_state(unit):
 
 
 def pgrep_exact(name):
+    """プロセスがあるか。True=いる、False=いない、None=不明（タイムアウトや pgrep の失敗）。"""
     rc, _ = run(["pgrep", "-x", name], timeout=5)
-    return rc == 0
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
 
 
 def steamvr_running():
     active, _ = unit_state("steamvr")
-    return active == "active" or pgrep_exact("vrserver")
+    return active == "active" or pgrep_exact("vrserver") is True
 
 
 STEAM_BOOTSTRAP_LOGS = (
@@ -222,8 +227,10 @@ def bootstrap_log_updating(text, mtime, now):
 
 
 def steam_client_updating(now=None):
+    """Steam クライアントが更新中か。True / False / None（ログが読めず不明）。"""
     now = now or time.time()
     seen = set()
+    readable = False
     for path in STEAM_BOOTSTRAP_LOGS:
         try:
             st = os.stat(path)
@@ -235,24 +242,27 @@ def steam_client_updating(now=None):
                 text = f.read()
         except OSError:
             continue
+        readable = True
         if bootstrap_log_updating(text, st.st_mtime, now):
             return True
-    return False
+    return None if not readable else False
 
 
 def steamos_updating():
-    rc, _ = run(["pgrep", "-x", "steamos-update"], timeout=5)
-    return rc == 0
+    """SteamOS の更新プロセスがあるか。True / False / None（pgrep 失敗で不明）。"""
+    return pgrep_exact("steamos-update")
 
 
 def update_in_progress(now=None):
-    """いま更新中なら、人が読む理由のリスト。空なら更新中ではない。"""
+    """(更新中の理由リスト, 判定できないか)。判定できないときは --fix しない。"""
+    steam = steam_client_updating(now=now)
+    osu = steamos_updating()
     reasons = []
-    if steam_client_updating(now=now):
+    if steam is True:
         reasons.append("Steam の更新中")
-    if steamos_updating():
+    if osu is True:
         reasons.append("SteamOS の更新中")
-    return reasons
+    return reasons, (steam is None or osu is None)
 
 
 def vrwebhelper_dumped_since(since_unix):
@@ -275,6 +285,7 @@ def vrwebhelper_dumped_since(since_unix):
 def diagnose_steamvr_ui(now=None):
     """SteamVR が動いている前提で、画面 UI（vrwebhelper）が今生きているか。
     起動直後の 1 分は、まだ立ち上がっていないことがあるので異常にしない。
+    起動時刻が取れないとき、プロセス確認が失敗したときは異常と断定しない（--fix もしない）。
     プロセスが生きていれば、過去のコアダンプだけでは異常にしない。
     """
     now = now or time.time()
@@ -282,9 +293,18 @@ def diagnose_steamvr_ui(now=None):
     started = unit_started("steamvr")
     young = started is not None and (now - started) < STARTUP_GRACE_SECONDS
     dumped = vrwebhelper_dumped_since(started) if started is not None else False
-    data = {"helper_running": helper, "dumped": dumped, "young": young, "started": started}
-    if helper:
+    data = {"helper_running": helper, "dumped": dumped, "young": young, "started": started,
+            "check_note": None, "skip_reason": None}
+    if helper is True:
         return dict(data, ok=True, problem=None)
+    if helper is None:
+        return dict(data, ok=True, problem=None,
+                    check_note="画面のUIを確認できませんでした",
+                    skip_reason="画面のUIを確認できないので、再起動しませんでした。")
+    if started is None:
+        return dict(data, ok=True, problem=None,
+                    check_note="SteamVR の起動時刻が取れないので、画面UIは判定していません",
+                    skip_reason="SteamVR の起動時刻が取れないので、再起動しませんでした。")
     if young:
         return dict(data, ok=True, problem=None)
     problem = "画面のUIが落ちています"
@@ -296,33 +316,51 @@ def diagnose_steamvr_ui(now=None):
 def check_steamvr(r, now=None):
     active, _ = unit_state("steamvr")
     server = pgrep_exact("vrserver")
-    if not (active == "active" or server):
+    extra_base = {"service": active, "vrserver": server is True}
+    if active != "active" and server is None:
+        r.add("SteamVR", INFO, "SteamVR", "SteamVR の状態を確認できませんでした", brief="SteamVR",
+              reason="SteamVR の状態を確認できませんでした", **extra_base)
+        return
+    if not (active == "active" or server is True):
         # デスクトップモードでは止まっているのが普通なので、警告にはしない
         r.add("SteamVR", INFO, "SteamVR", "動いていません（デスクトップモードなら正常）", brief="SteamVR", reason="停止中",
-              service=active, vrserver=False)
+              **extra_base)
         return
     ui = diagnose_steamvr_ui(now=now)
-    extra = {k: ui[k] for k in ("helper_running", "dumped", "young")}
-    if ui["ok"]:
-        r.add("SteamVR", OK, "SteamVR", "動いています", brief="SteamVR", service=active, vrserver=server, **extra)
+    extra = {**extra_base, **{k: ui[k] for k in ("helper_running", "dumped", "young")}}
+    if ui.get("check_note"):
+        r.add("SteamVR", INFO, "SteamVR", ui["check_note"], brief="SteamVR",
+              reason=ui["check_note"], **extra)
+    elif ui["ok"]:
+        r.add("SteamVR", OK, "SteamVR", "動いています", brief="SteamVR", **extra)
     else:
         r.add("SteamVR", WARN, "SteamVR", f"動いていますが、{ui['problem']}", brief="SteamVR",
-              reason=ui["problem"], service=active, vrserver=server, **extra)
+              reason=ui["problem"], **extra)
 
 
-def apply_steamvr_ui_fix(now=None, wait=True, wait_seconds=25):
+def apply_steamvr_ui_fix(now=None, wait=True, wait_seconds=45):
     """画面 UI が落ちていれば steamvr.service だけ再起動する。
-    更新中はしない。frame-video-player など他のユニットは触らない。
+    更新中、または判定できないときはしない。frame-video-player など他のユニットは触らない。
+    steamvr.service が active のときだけ restart する（vrserver だけ動いているときは起動しない）。
     戻り値: {did_restart, recovered, message}
     """
-    if not steamvr_running():
+    active, _ = unit_state("steamvr")
+    if active != "active":
+        if not steamvr_running():
+            return {"did_restart": False, "recovered": False,
+                    "message": "SteamVR が止まっているので、再起動しませんでした。"}
         return {"did_restart": False, "recovered": False,
-                "message": "SteamVR が止まっているので、再起動しませんでした。"}
+                "message": "steamvr.service が動いていないので、再起動しませんでした。"}
     ui = diagnose_steamvr_ui(now=now)
+    if ui.get("skip_reason"):
+        return {"did_restart": False, "recovered": False, "message": ui["skip_reason"]}
     if ui["ok"]:
         return {"did_restart": False, "recovered": True,
                 "message": "画面のUIは動いているので、SteamVR は再起動しませんでした。"}
-    busy = update_in_progress(now=now)
+    busy, unknown = update_in_progress(now=now)
+    if unknown:
+        return {"did_restart": False, "recovered": False,
+                "message": "更新中かどうかを確認できないので、SteamVR は再起動しませんでした。"}
     if busy:
         return {"did_restart": False, "recovered": False,
                 "message": "、".join(busy) + "なので、SteamVR は再起動しませんでした。"}

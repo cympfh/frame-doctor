@@ -310,7 +310,7 @@ class SteamVrUiTest(unittest.TestCase):
         self.assertFalse(fd.vrwebhelper_dumped_since(None))
 
     def test_fix_skips_when_ok(self):
-        with mock.patch.object(fd, "steamvr_running", return_value=True), \
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
                 mock.patch.object(fd, "diagnose_steamvr_ui", return_value={"ok": True, "problem": None}), \
                 mock.patch.object(fd, "run") as run:
             out = fd.apply_steamvr_ui_fix(wait=False)
@@ -319,9 +319,9 @@ class SteamVrUiTest(unittest.TestCase):
         run.assert_not_called()
 
     def test_fix_skips_when_updating(self):
-        with mock.patch.object(fd, "steamvr_running", return_value=True), \
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
                 mock.patch.object(fd, "diagnose_steamvr_ui", return_value={"ok": False, "problem": "画面のUIが落ちています"}), \
-                mock.patch.object(fd, "update_in_progress", return_value=["Steam の更新中"]), \
+                mock.patch.object(fd, "update_in_progress", return_value=(["Steam の更新中"], False)), \
                 mock.patch.object(fd, "run") as run:
             out = fd.apply_steamvr_ui_fix(wait=False)
         self.assertFalse(out["did_restart"])
@@ -338,9 +338,10 @@ class SteamVrUiTest(unittest.TestCase):
         def pgrep(name):
             return name in ("vrserver", "vrwebhelper")
 
-        with mock.patch.object(fd, "steamvr_running", return_value=True), \
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
+                mock.patch.object(fd, "steamvr_running", return_value=True), \
                 mock.patch.object(fd, "diagnose_steamvr_ui", return_value={"ok": False, "problem": "x"}), \
-                mock.patch.object(fd, "update_in_progress", return_value=[]), \
+                mock.patch.object(fd, "update_in_progress", return_value=([], False)), \
                 mock.patch.object(fd, "pgrep_exact", side_effect=pgrep), \
                 mock.patch.object(fd, "run", side_effect=run):
             out = fd.apply_steamvr_ui_fix(wait=False)
@@ -349,6 +350,98 @@ class SteamVrUiTest(unittest.TestCase):
         self.assertEqual(calls, [["systemctl", "--user", "restart", "steamvr.service"]])
         joined = " ".join(c for cmd in calls for c in cmd)
         self.assertNotIn("frame-video-player", joined)
+
+    def test_pgrep_exact_three_valued(self):
+        with mock.patch.object(fd, "run", return_value=(0, "123")):
+            self.assertIs(fd.pgrep_exact("vrwebhelper"), True)
+        with mock.patch.object(fd, "run", return_value=(1, "")):
+            self.assertIs(fd.pgrep_exact("vrwebhelper"), False)
+        with mock.patch.object(fd, "run", return_value=(2, "syntax")):
+            self.assertIsNone(fd.pgrep_exact("vrwebhelper"))
+        with mock.patch.object(fd, "run", return_value=(-1, "timed out")):
+            self.assertIsNone(fd.pgrep_exact("vrwebhelper"))
+
+    def test_grace_boundary_59_and_60(self):
+        ui59 = self._diag(False, 59, False)
+        self.assertTrue(ui59["ok"])
+        self.assertTrue(ui59["young"])
+        ui60 = self._diag(False, 60, False)
+        self.assertFalse(ui60["ok"])
+        self.assertFalse(ui60["young"])
+
+    def test_started_none_does_not_warn_or_fix(self):
+        ui = self._diag(False, None, False)
+        self.assertTrue(ui["ok"])
+        self.assertIn("起動時刻", ui["skip_reason"])
+        r = fd.Report()
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
+                mock.patch.object(fd, "pgrep_exact", return_value=False), \
+                mock.patch.object(fd, "unit_started", return_value=None), \
+                mock.patch.object(fd, "vrwebhelper_dumped_since", return_value=False), \
+                mock.patch.object(fd, "run") as run:
+            fd.check_steamvr(r, now=1_000_000)
+            out = fd.apply_steamvr_ui_fix(wait=False)
+        self.assertEqual(r.items[0]["level"], "INFO")
+        self.assertIn("起動時刻", fd.brief_line(r.items[0]))
+        self.assertFalse(out["did_restart"])
+        self.assertIn("起動時刻", out["message"])
+        run.assert_not_called()
+
+    def test_unknown_pgrep_does_not_fix(self):
+        ui = self._diag(None, 600, False)
+        self.assertTrue(ui["ok"])
+        self.assertIn("確認できない", ui["skip_reason"])
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
+                mock.patch.object(fd, "pgrep_exact", return_value=None), \
+                mock.patch.object(fd, "unit_started", return_value=1_000_000 - 600), \
+                mock.patch.object(fd, "vrwebhelper_dumped_since", return_value=False), \
+                mock.patch.object(fd, "run") as run:
+            out = fd.apply_steamvr_ui_fix(now=1_000_000, wait=False)
+        self.assertFalse(out["did_restart"])
+        self.assertIn("確認できない", out["message"])
+        run.assert_not_called()
+
+    def test_unreadable_bootstrap_log_is_unknown(self):
+        with mock.patch.object(fd, "STEAM_BOOTSTRAP_LOGS", ("/no/such/bootstrap_log.txt",)):
+            self.assertIsNone(fd.steam_client_updating(now=1_000_000))
+
+    def test_fix_skips_when_update_unknown(self):
+        with mock.patch.object(fd, "unit_state", return_value=("active", "enabled")), \
+                mock.patch.object(fd, "diagnose_steamvr_ui", return_value={"ok": False, "problem": "画面のUIが落ちています"}), \
+                mock.patch.object(fd, "update_in_progress", return_value=([], True)), \
+                mock.patch.object(fd, "run") as run:
+            out = fd.apply_steamvr_ui_fix(wait=False)
+        self.assertFalse(out["did_restart"])
+        self.assertIn("確認できない", out["message"])
+        run.assert_not_called()
+
+    def test_fix_skips_when_unit_inactive(self):
+        with mock.patch.object(fd, "unit_state", return_value=("inactive", "enabled")), \
+                mock.patch.object(fd, "steamvr_running", return_value=True), \
+                mock.patch.object(fd, "run") as run:
+            out = fd.apply_steamvr_ui_fix(wait=False)
+        self.assertFalse(out["did_restart"])
+        self.assertIn("steamvr.service", out["message"])
+        run.assert_not_called()
+
+    def test_main_fix_only_when_flag(self):
+        import contextlib
+        import io
+        fake = {"did_restart": False, "recovered": True, "message": "ok"}
+        names = ["use_real_user_session", "check_temps", "check_throttling", "check_battery",
+                 "check_disks", "check_uptime", "check_steamvr", "check_passthrough",
+                 "check_tools", "check_eye", "check_audio", "check_mic", "check_logs"]
+        with contextlib.ExitStack() as stack:
+            for name in names:
+                stack.enter_context(mock.patch.object(fd, name))
+            stack.enter_context(mock.patch.object(fd, "steamvr_running", return_value=False))
+            fix = stack.enter_context(mock.patch.object(fd, "apply_steamvr_ui_fix", return_value=fake))
+            with contextlib.redirect_stdout(io.StringIO()):
+                fd.main(["--no-network", "--no-color"])
+            fix.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()):
+                fd.main(["--fix", "--no-network", "--no-color"])
+            fix.assert_called_once()
 
 
 if __name__ == "__main__":
